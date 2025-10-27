@@ -1,0 +1,188 @@
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.transform import from_origin
+import os
+from scipy.stats import linregress
+from datetime import datetime, timedelta
+
+# =========================================================================
+# --- CONFIGURATION ---
+# =========================================================================
+
+# Folder containing observed single-pixel GeoTIFFs
+OBSERVED_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\MIN"
+
+# Folder for output results (created automatically)
+OUTPUT_FOLDER = os.path.join(OBSERVED_FOLDER, "Tmin_Validation_
+M_S_W")
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# List of model-generated datasets (gridded data)
+GENERATED_FILES_TO_VALIDATE = [
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\CSF_v2_Tmin_clipped.tif",
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\ERA5_Tmin_clipped.tif",
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\IMD_Tmin.tif",
+]
+
+# NoData value used in GeoTIFFs
+NODATA_VALUE = -9999.0
+
+# Start and end dates (must match number of bands in files)
+START_DATE = "2019-01-01"
+END_DATE   = "2024-12-31"
+
+# =========================================================================
+# --- HELPER FUNCTIONS ---
+# =========================================================================
+
+def get_pixel_center_coords(dataset):
+    """Returns (lon, lat) of pixel center from rasterio transform."""
+    transform = dataset.transform
+    x_origin = transform[2]
+    y_origin = transform[5]
+    x_res = abs(transform[0])
+    y_res = abs(transform[4])
+    center_lon = x_origin + (x_res / 2.0)
+    center_lat = y_origin - (y_res / 2.0)
+    return center_lon, center_lat
+
+
+def create_date_dataframe(start_date, end_date):
+    """Create dataframe linking each band to a date, month, IMD-week, and IMD-season."""
+    dates = pd.date_range(start=start_date, end=end_date, freq="D")
+    df = pd.DataFrame({"band": np.arange(1, len(dates) + 1), "date": dates})
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+
+    # --- IMD Standard Meteorological Weeks (SMWs) ---
+    df["week"] = ((df["date"] - pd.to_datetime(df["date"].dt.year.astype(str) + "-01-01")).dt.days // 7) + 1
+
+    # --- IMD Season definitions ---
+    def get_season(month):
+        if month in [12, 1, 2]:
+            return "Winter"
+        elif month in [3, 4, 5]:
+            return "Summer"
+        elif month in [6, 7, 8, 9]:
+            return "Monsoon"
+        elif month in [10, 11]:
+            return "PostMonsoon"
+        else:
+            return "NA"
+
+    df["season"] = df["month"].apply(get_season)
+    return df
+
+
+def validate_and_group(observed_path, generated_path, nodata_value, df_dates, group_col):
+    """Validate grouped (month, season, week) observed vs generated GeoTIFFs."""
+    results = []
+    obs_name = os.path.splitext(os.path.basename(observed_path))[0]
+    gen_name = os.path.splitext(os.path.basename(generated_path))[0]
+
+    try:
+        with rasterio.open(observed_path) as src_obs, rasterio.open(generated_path) as src_gen:
+            obs_data = src_obs.read(masked=False)
+            N_bands_obs = src_obs.count
+            N_bands_gen = src_gen.count
+
+            if N_bands_obs != N_bands_gen:
+                print(f"⚠️ Band mismatch for {obs_name} (Obs={N_bands_obs}, Gen={N_bands_gen}) — skipped.")
+                return results
+
+            # Get pixel coordinate
+            center_lon, center_lat = get_pixel_center_coords(src_obs)
+
+            # Extract generated time series at that pixel
+            sample_gen = list(src_gen.sample([(center_lon, center_lat)], indexes=range(1, N_bands_gen + 1)))
+            gen_data = np.array(sample_gen[0])
+
+            # Build dataframe
+            df = pd.DataFrame({
+                "band": np.arange(1, N_bands_obs + 1),
+                "obs": obs_data.flatten(),
+                "gen": gen_data
+            })
+            df = df.merge(df_dates, on="band", how="left")
+
+            # --- Check data availability (≥4 years of valid data) ---
+            valid_mask = (df["obs"] != nodata_value) & (df["gen"] != nodata_value)
+            if np.sum(valid_mask) < (4 * 365):  # roughly 4 years of valid days
+                print(f"⚠️ {obs_name} has less than 4 years of valid data — skipped.")
+                return results
+
+            # --- Group by month/season/week ---
+            for grp, gdf in df.groupby(group_col):
+                mask = (gdf["obs"] != nodata_value) & (gdf["gen"] != nodata_value)
+                if not np.any(mask):
+                    continue
+
+                obs_valid = gdf.loc[mask, "obs"]
+                gen_valid = gdf.loc[mask, "gen"]
+
+                rmse = np.sqrt(np.mean((gen_valid - obs_valid) ** 2))
+                bias = np.mean(gen_valid - obs_valid)
+                try:
+                    r2 = linregress(obs_valid, gen_valid).rvalue ** 2 if len(obs_valid) > 1 else np.nan
+                except Exception:
+                    r2 = np.nan
+
+                results.append({
+                    "Observed_File": os.path.basename(observed_path),
+                    "Generated_File": os.path.basename(generated_path),
+                    "Lon": center_lon,
+                    "Lat": center_lat,
+                    group_col: grp,
+                    "N": len(obs_valid),
+                    "RMSE": rmse,
+                    "Bias": bias,
+                    "R2": r2
+                })
+
+            print(f"✅ {obs_name} vs {gen_name} grouped by {group_col} completed.")
+
+    except Exception as e:
+        print(f"❌ Error processing {obs_name}: {e}")
+
+    return results
+
+
+# =========================================================================
+# --- MAIN EXECUTION ---
+# =========================================================================
+
+if __name__ == "__main__":
+    print("\n=== Starting Monthwise, Seasonwise, and Weekwise Validation ===")
+
+    observed_files = [
+        os.path.join(OBSERVED_FOLDER, f)
+        for f in os.listdir(OBSERVED_FOLDER)
+        if f.lower().endswith(".tif")
+    ]
+
+    if not observed_files:
+        print(f"⚠️ No observed TIFF files found in {OBSERVED_FOLDER}")
+        exit()
+
+    # Create the date mapping dataframe
+    df_dates = create_date_dataframe(START_DATE, END_DATE)
+
+    for grouping in ["month", "season", "week"]:
+        print(f"\n📊 Processing grouping: {grouping.upper()}")
+        all_group_results = []
+
+        for obs_path in observed_files:
+            for gen_path in GENERATED_FILES_TO_VALIDATE:
+                if os.path.exists(gen_path):
+                    res = validate_and_group(obs_path, gen_path, NODATA_VALUE, df_dates, grouping)
+                    all_group_results.extend(res)
+                else:
+                    print(f"⚠️ Missing generated file: {gen_path}")
+
+        if all_group_results:
+            output_excel = os.path.join(OUTPUT_FOLDER, f"Validation_{grouping}.xlsx")
+            pd.DataFrame(all_group_results).to_excel(output_excel, index=False)
+            print(f"✅ Saved {grouping} results to {output_excel}")
+        else:
+            print(f"⚠️ No {grouping} results generated.")
