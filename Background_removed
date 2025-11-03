@@ -1,0 +1,51 @@
+import os
+import rasterio
+from rasterio.mask import mask
+import geopandas as gpd
+
+# --- Paths ---
+input_folder = r"D:\ERA5_Download\ERA5_Outputs\New folder"    # folder with your big ERA5 TIFFs
+shapefile = r"D:\vector\SOI_Bndry_2025\INDIA_BOUNDARY_SOI.shp"  # ROI shapefile
+output_folder = r"D:\ERA5_Download\ERA5_Outputs\Clipped_Files"  # where to save outputs
+os.makedirs(output_folder, exist_ok=True)
+
+# --- Load ROI ---
+roi = gpd.read_file(shapefile)
+geom = [roi.union_all()]
+print(f"ROI loaded: {roi.crs}, {len(roi)} feature(s)")
+
+# --- Gather TIFF files ---
+files = sorted([f for f in os.listdir(input_folder) if f.lower().endswith(".tif")])
+if not files:
+    raise FileNotFoundError("No .tif files found in the input folder!")
+
+print(f"Found {len(files)} TIFFs to process...")
+
+# --- Loop through and clip each ---
+for f in files:
+    in_path = os.path.join(input_folder, f)
+    out_name = os.path.splitext(f)[0] + "_clipped.tif"
+    out_path = os.path.join(output_folder, out_name)
+
+    with rasterio.open(in_path) as src:
+        # Ensure CRS match
+        roi_in_raster_crs = roi.to_crs(src.crs)
+        geom = [roi_in_raster_crs.unary_union]
+
+        # Clip
+        out_img, out_transform = mask(src, geom, crop=True, nodata=src.nodata or -9999)
+
+        out_meta = src.meta.copy()
+        out_meta.update({
+            "height": out_img.shape[1],
+            "width": out_img.shape[2],
+            "transform": out_transform,
+            "nodata": src.nodata or -9999
+        })
+
+        with rasterio.open(out_path, "w", **out_meta) as dest:
+            dest.write(out_img)
+
+    print(f"✅ Clipped and saved: {out_name}")
+
+print("🎯 All files clipped successfully!")
