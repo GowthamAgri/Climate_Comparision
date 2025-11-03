@@ -1,0 +1,55 @@
+import os
+import pandas as pd
+import numpy as np
+
+# ---------------- CONFIGURATION ----------------
+INPUT_FOLDER = r"D:\Climate_Accuracy_Analysis\Output"    # 🔹 Change this
+OUTPUT_FOLDER = os.path.join(INPUT_FOLDER, "Processed_CSV")
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+# ------------------------------------------------
+
+def find_col(columns, target):
+    """Find column name in a case-insensitive way."""
+    for c in columns:
+        if c.strip().lower() == target.lower():
+            return c
+    return None
+
+# Process each CSV
+for file in os.listdir(INPUT_FOLDER):
+    if file.lower().endswith(".csv"):
+        file_path = os.path.join(INPUT_FOLDER, file)
+        try:
+            df = pd.read_csv(file_path, encoding="utf-8", index_col=None)
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, encoding="latin1", index_col=None)
+
+        # Remove any existing unnamed columns
+        df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+
+        # Find MAX and MIN columns
+        max_col = find_col(df.columns, "MAX")
+        min_col = find_col(df.columns, "MIN")
+
+        if max_col is None or min_col is None:
+            print(f"⚠️ Skipping {file} — missing MAX or MIN column.")
+            continue
+
+        # Convert to numeric
+        df[max_col] = pd.to_numeric(df[max_col], errors="coerce")
+        df[min_col] = pd.to_numeric(df[min_col], errors="coerce")
+
+        # Compute MEAN
+        mean_series = (df[max_col] + df[min_col]) / 2.0
+
+        # Insert MEAN right after MIN column
+        min_idx = df.columns.get_loc(min_col)
+        df.insert(min_idx + 1, "MEAN", mean_series)
+
+        # Save updated CSV without index
+        out_path = os.path.join(OUTPUT_FOLDER, file)
+        df.to_csv(out_path, index=False, encoding="utf-8")
+
+        print(f"✅ Processed: {file}")
+
+print("🎯 All CSVs processed. Updated files saved in 'Processed_CSV' folder.")
