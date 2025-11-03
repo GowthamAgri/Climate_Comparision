@@ -1,0 +1,179 @@
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.transform import from_origin
+import os
+from scipy.stats import linregress
+
+# =========================================================================
+# --- CONFIGURATION ---
+# =========================================================================
+
+# Folder containing observed single-pixel GeoTIFFs
+OBSERVED_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\MEAN"
+
+# Folder for output results (created automatically)
+OUTPUT_FOLDER = os.path.join(OBSERVED_FOLDER, "Validation_Results")
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# Output Excel file path
+OUTPUT_EXCEL_PATH = os.path.join(OUTPUT_FOLDER, "Validation_Results.xlsx")
+
+# List of multi-pixel datasets (gridded data to validate)
+GENERATED_FILES_TO_VALIDATE = [
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\CSF_v2_MEAN.tif",
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\ERA5_MEAN.tif",
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\IMD_MEAN.tif",
+]
+
+# NoData value used in GeoTIFFs
+NODATA_VALUE = -9999.0
+
+
+# =========================================================================
+# --- HELPER FUNCTIONS ---
+# =========================================================================
+
+def get_pixel_center_coords(dataset):
+    """Returns (lon, lat) of pixel center from rasterio transform."""
+    transform = dataset.transform
+    x_origin = transform[2]  # west boundary
+    y_origin = transform[5]  # north boundary
+    x_res = abs(transform[0])
+    y_res = abs(transform[4])
+    center_lon = x_origin + (x_res / 2.0)
+    center_lat = y_origin - (y_res / 2.0)
+    return center_lon, center_lat
+
+
+def validate_and_create_diff_tiff(observed_path, generated_path, nodata_value, output_folder):
+    """Compare single-pixel observed GeoTIFF against multi-pixel generated dataset, 
+    compute metrics, and save difference GeoTIFF."""
+    
+    result = {
+        "Observed_File": os.path.basename(observed_path),
+        "Generated_File": os.path.basename(generated_path),
+        "Lon": None,
+        "Lat": None,
+        "RMSE": np.nan,
+        "Bias": np.nan,
+        "R2": np.nan,
+        "N": 0,
+        "Diff_TIFF": None
+    }
+
+    try:
+        # --- Load observed data ---
+        with rasterio.open(observed_path) as src_obs:
+            obs_data = src_obs.read(masked=False).flatten()
+            center_lon, center_lat = get_pixel_center_coords(src_obs)
+            result["Lon"], result["Lat"] = center_lon, center_lat
+            N_bands_obs = src_obs.count
+            obs_meta = src_obs.meta.copy()
+
+        # --- Load generated dataset ---
+        with rasterio.open(generated_path) as src_gen:
+            N_bands_gen = src_gen.count
+
+            if N_bands_obs != N_bands_gen:
+                print(f"⚠️ Band mismatch: {os.path.basename(observed_path)} "
+                      f"(Obs={N_bands_obs}, Gen={N_bands_gen}) — skipped.")
+                return result
+
+            # Sample pixel time series at the observed station's location
+            sample_gen = list(src_gen.sample([(center_lon, center_lat)], indexes=range(1, N_bands_gen + 1)))
+            gen_data = np.array(sample_gen[0])
+
+        # --- Compute difference (Generated - Observed) ---
+        diff_data = gen_data - obs_data
+        diff_data[np.isnan(diff_data)] = nodata_value  # handle NaNs
+        diff_data = diff_data.astype(np.float32).reshape(-1, 1, 1)  # (bands, rows, cols)
+
+        # --- Filter out NoData values ---
+        valid_mask = (obs_data != nodata_value) & (gen_data != nodata_value)
+        if not np.any(valid_mask):
+            print(f"⚠️ No valid data overlap for {os.path.basename(observed_path)} vs {os.path.basename(generated_path)}")
+            return result
+
+        obs_valid = obs_data[valid_mask]
+        gen_valid = gen_data[valid_mask]
+
+        # --- Compute metrics ---
+        rmse = np.sqrt(np.mean((gen_valid - obs_valid) ** 2))
+        bias = np.mean(gen_valid - obs_valid)
+        try:
+            slope, intercept, r_value, p_value, std_err = linregress(obs_valid, gen_valid)
+            r_squared = r_value ** 2
+        except ValueError:
+            r_squared = np.nan
+
+        result.update({
+            "RMSE": rmse,
+            "Bias": bias,
+            "R2": r_squared,
+            "N": len(obs_valid)
+        })
+
+        # --- Save difference GeoTIFF ---
+        gen_name = os.path.splitext(os.path.basename(generated_path))[0]
+        obs_name = os.path.splitext(os.path.basename(observed_path))[0]
+        diff_filename = f"{obs_name}_{gen_name}_DIFF.tif"
+        diff_path = os.path.join(output_folder, diff_filename)
+
+        diff_meta = obs_meta.copy()
+        diff_meta.update({
+            "dtype": "float32",
+            "count": diff_data.shape[0],
+            "nodata": nodata_value
+        })
+
+        with rasterio.open(diff_path, "w", **diff_meta) as dst:
+            dst.write(diff_data)
+
+        result["Diff_TIFF"] = diff_path
+
+        print(f"✅ {obs_name} vs {gen_name} → RMSE={rmse:.3f}, Bias={bias:.3f}, R²={r_squared:.3f}")
+        print(f"📄 Difference TIFF saved: {diff_path}")
+
+    except Exception as e:
+        print(f"❌ Error validating {os.path.basename(observed_path)}: {e}")
+
+    return result
+
+
+# =========================================================================
+# --- MAIN EXECUTION ---
+# =========================================================================
+
+if __name__ == "__main__":
+    print("\n=== Starting Batch Validation and GeoTIFF Creation ===")
+
+    observed_files = [
+        os.path.join(OBSERVED_FOLDER, f)
+        for f in os.listdir(OBSERVED_FOLDER)
+        if f.lower().endswith(".tif")
+    ]
+
+    if not observed_files:
+        print(f"⚠️ No observed TIFF files found in {OBSERVED_FOLDER}")
+        exit()
+
+    all_results = []
+
+    for obs_path in observed_files:
+        print(f"\n📂 Processing observed file: {os.path.basename(obs_path)}")
+        for gen_path in GENERATED_FILES_TO_VALIDATE:
+            if os.path.exists(gen_path):
+                res = validate_and_create_diff_tiff(obs_path, gen_path, NODATA_VALUE, OUTPUT_FOLDER)
+                all_results.append(res)
+            else:
+                print(f"⚠️ Missing generated file: {gen_path}")
+
+    # --- Save all results to Excel ---
+    if all_results:
+        df_results = pd.DataFrame(all_results)
+        df_results.to_excel(OUTPUT_EXCEL_PATH, index=False)
+        print(f"\n📊 Validation summary saved to: {OUTPUT_EXCEL_PATH}")
+        print(f"✅ Total Comparisons: {len(all_results)}")
+    else:
+        print("\n⚠️ No validation results generated.")
