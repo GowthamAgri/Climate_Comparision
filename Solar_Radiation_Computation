@@ -1,0 +1,91 @@
+import rasterio
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+def calculate_solar_radiation(input_folder_tmax, input_folder_tmin, output_folder, k_rs=0.16):
+    tmax_dir = Path(input_folder_tmax)
+    tmin_dir = Path(input_folder_tmin)
+    out_dir = Path(output_folder)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tmax_files = list(tmax_dir.glob("*.tif"))
+    dates = pd.date_range(start="2019-01-01", end="2024-12-31")
+
+    for tmax_path in tmax_files:
+        tmax_name = tmax_path.name
+        
+        # Mapping names: handle Tmax/Tmin, MAX/MIN, or tx/tn
+        tmin_name = tmax_name.replace("Tmax", "Tmin").replace("MAX", "MIN").replace("_Tx", "_Tn")
+        tmin_path = tmin_dir / tmin_name
+        
+        # Output naming
+        output_name = tmax_name.replace("Tmax", "Rs").replace("MAX", "Rs").replace("Tx", "Rs")
+        output_path = out_dir / output_name
+
+        if not tmin_path.exists():
+            print(f"Skipping {tmax_name}: Looked for {tmin_name} but it does not exist.")
+            continue
+
+        print(f"\n--- Processing: {tmax_name} ---")
+
+        with rasterio.open(tmax_path) as tmax_src, rasterio.open(tmin_path) as tmin_src:
+            meta = tmax_src.meta.copy()
+            meta.update(dtype=rasterio.float32, count=len(dates))
+            
+            height, width = tmax_src.height, tmax_src.width
+            
+            # --- THE FIX: Explicit Reshaping of Latitudes ---
+            # 1. Create indices for every pixel
+            rows, cols = np.indices((height, width))
+            # 2. Get the Y coordinates (Latitudes)
+            # transform.xy returns a list of coordinates for each point
+            _, lats_list = rasterio.transform.xy(tmax_src.transform, rows.ravel(), cols.ravel())
+            # 3. Convert to array and RESHAPE to match (height, width)
+            latitudes = np.deg2rad(np.array(lats_list).reshape(height, width))
+
+            with rasterio.open(output_path, 'w', **meta) as dst:
+                for b_idx, date in enumerate(dates):
+                    band_num = b_idx + 1
+                    
+                    # Read Tmax/Tmin
+                    tmax = tmax_src.read(band_num).astype(np.float32)
+                    tmin = tmin_src.read(band_num).astype(np.float32)
+                    
+                    doy = date.dayofyear
+                    
+                    # --- Extraterrestrial Radiation (Ra) ---
+                    
+                    solar_dec = 0.409 * np.sin((2 * np.pi / 365) * doy - 1.39)
+                    dr = 1 + 0.033 * np.cos((2 * np.pi / 365) * doy)
+                    
+                    # Sunset hour angle (ws)
+                    arg = -np.tan(latitudes) * np.tan(solar_dec)
+                    ws = np.arccos(np.clip(arg, -1, 1))
+                    
+                    # Ra calculation (Gsc = 0.0820 MJ/m2/min)
+                    ra = (24 * 60 / np.pi) * 0.0820 * dr * (
+                        ws * np.sin(latitudes) * np.sin(solar_dec) +
+                        np.cos(latitudes) * np.cos(solar_dec) * np.sin(ws)
+                    )
+
+                    # --- Hargreaves-Samani (Rs) ---
+                    tdiff = tmax - tmin
+                    tdiff = np.where(tdiff < 0, 0, tdiff) # Safety for physical impossibility
+                    
+                    rs = k_rs * ra * np.sqrt(tdiff)
+                    
+                    # Write results
+                    dst.write(rs.astype(rasterio.float32), band_num)
+                    
+                    if date.is_month_start and date.month == 1:
+                        print(f"  {date.year} processed.")
+
+    print(f"\nSuccess! All files in {output_folder} are ready.")
+
+# --- PATHS ---
+TMAX_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\SRD_All\Era_Tx"
+TMIN_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\SRD_All\Era_Tn"
+OUTPUT_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\SRD_All\Rs_Results"
+
+calculate_solar_radiation(TMAX_FOLDER, TMIN_FOLDER, OUTPUT_FOLDER)
