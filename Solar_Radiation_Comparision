@@ -1,0 +1,129 @@
+import numpy as np
+import pandas as pd
+import rasterio
+import os
+from scipy.stats import linregress
+
+# =========================================================================
+# --- CONFIGURATION ---
+# =========================================================================
+OBSERVED_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\SRD"
+OUTPUT_FOLDER = r"D:\Climate_Accuracy_Analysis\Final_Outputs\Trial\SRD_Validation_Final"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+GENERATED_FILES_TO_VALIDATE = [
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\CFSv2_SRD_clipped.tif",
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\ERA5_SRD_clipped.tif",
+    r"D:\Climate_Accuracy_Analysis\Final_Outputs\IMD_SRD.tif",
+]
+
+NODATA_VALUE = -9999.0
+START_DATE = "2019-01-01"
+END_DATE   = "2024-12-31"
+
+# =========================================================================
+# --- VALIDATION FUNCTION ---
+# =========================================================================
+
+def validate_and_group(observed_path, generated_path, df_dates, group_col):
+    results = []
+    obs_name = os.path.splitext(os.path.basename(observed_path))[0]
+    gen_name = os.path.splitext(os.path.basename(generated_path))[0]
+
+    try:
+        with rasterio.open(observed_path) as src_obs, rasterio.open(generated_path) as src_gen:
+            # FIX: Read ALL bands from the observed file, not just band 1
+            obs_data = src_obs.read().flatten() 
+            
+            # Get location and sample all bands from generated file
+            t = src_obs.transform
+            lon, lat = t[2] + (abs(t[0])/2), t[5] - (abs(t[4])/2)
+            
+            sample_gen = list(src_gen.sample([(lon, lat)]))
+            gen_data = np.array(sample_gen[0]).flatten()
+
+            # Sync lengths across Obs, Gen, and Date Range
+            min_len = min(len(obs_data), len(gen_data), len(df_dates))
+            
+            df = pd.DataFrame({
+                "obs": obs_data[:min_len],
+                "gen": gen_data[:min_len],
+                "month": df_dates["month"].iloc[:min_len].values,
+                "season": df_dates["season"].iloc[:min_len].values,
+                "week": df_dates["week"].iloc[:min_len].values
+            })
+
+            # Masking: NaNs, NoData, and non-physical values
+            mask = (np.isfinite(df["obs"])) & (np.isfinite(df["gen"])) & \
+                   (df["obs"] != NODATA_VALUE) & (df["gen"] != NODATA_VALUE) & \
+                   (df["obs"] >= 0) & (df["gen"] >= 0)
+
+            valid_df = df[mask]
+
+            if len(valid_df) < 5: # Need at least a few points for stats
+                return []
+
+            for grp, gdf in valid_df.groupby(group_col):
+                o, g = gdf["obs"], gdf["gen"]
+                if len(o) < 2: continue
+                
+                rmse = np.sqrt(np.mean((g - o) ** 2))
+                bias = np.mean(g - o)
+                # Avoid errors if all values are identical
+                try:
+                    r2 = linregress(o, g).rvalue**2
+                except:
+                    r2 = 0
+
+                results.append({
+                    "Observed_Site": obs_name, "Model": gen_name,
+                    "Lon": round(lon, 4), "Lat": round(lat, 4),
+                    group_col: grp, "N_Days": len(o),
+                    "RMSE_MJ": round(rmse, 3), "Bias_MJ": round(bias, 3), "R2": round(r2, 3)
+                })
+            
+            print(f"✅ Completed: {obs_name} vs {gen_name} (Found {len(valid_df)} valid days)")
+            
+    except Exception as e:
+        print(f"❌ Error in {obs_name}: {e}")
+        
+    return results
+
+# =========================================================================
+# --- MAIN EXECUTION ---
+# =========================================================================
+if __name__ == "__main__":
+    print("--- Starting Solar Radiation Validation ---")
+    
+    obs_files = [os.path.join(OBSERVED_FOLDER, f) for f in os.listdir(OBSERVED_FOLDER) if f.lower().endswith(".tif")]
+    
+    # Create Date Mapping
+    dates = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
+    df_dates = pd.DataFrame({"date": dates, "month": dates.month})
+    df_dates["week"] = ((df_dates["date"] - pd.to_datetime(df_dates["date"].dt.year.astype(str) + "-01-01")).dt.days // 7) + 1
+    
+    def get_season(m):
+        if m in [12, 1, 2]: return "Winter"
+        elif m in [3, 4, 5]: return "Summer"
+        elif m in [6, 7, 8, 9]: return "Monsoon"
+        else: return "PostMonsoon"
+    df_dates["season"] = df_dates["month"].apply(get_season)
+
+    for grouping in ["month", "season", "week"]:
+        final_results = []
+        print(f"\n📊 Processing {grouping.upper()}...")
+        
+        for obs_path in obs_files:
+            for gen_path in GENERATED_FILES_TO_VALIDATE:
+                if os.path.exists(gen_path):
+                    res = validate_and_group(obs_path, gen_path, df_dates, grouping)
+                    final_results.extend(res)
+        
+        if final_results:
+            out_path = os.path.join(OUTPUT_FOLDER, f"SRD_Validation_{grouping}.xlsx")
+            pd.DataFrame(final_results).to_excel(out_path, index=False)
+            print(f"📁 SUCCESS: Saved to {out_path}")
+        else:
+            print(f"⚠️ No results for {grouping}. Check if Observed files have multiple bands.")
+
+    print("\n--- Process Finished ---")
