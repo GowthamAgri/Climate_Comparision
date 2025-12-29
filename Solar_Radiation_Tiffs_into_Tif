@@ -1,0 +1,85 @@
+import rasterio
+from rasterio.merge import merge
+import glob
+import os
+import numpy as np
+
+# =========================================================================
+# --- CONFIGURATION ---
+# =========================================================================
+tiff_folder = r"D:\Global Solar Radiation\Solar Radiation\datafiles\Trial\GeoTIFF_Outputs"
+output_path = r"D:\Global Solar Radiation\Solar Radiation\datafiles\Trial\GeoTIFF_Outputs\full.tif"
+search_subfolders = True
+
+# =========================================================================
+# --- FIND ALL TILES ---
+# =========================================================================
+if search_subfolders:
+    tif_files = [os.path.join(root, f)
+                 for root, _, files in os.walk(tiff_folder)
+                 for f in files if f.lower().endswith(".tif")]
+else:
+    tif_files = glob.glob(os.path.join(tiff_folder, "*.tif"))
+
+if not tif_files:
+    raise FileNotFoundError("❌ No GeoTIFF files found.")
+
+print(f"Found {len(tif_files)} tiles to merge...")
+
+# =========================================================================
+# --- OPEN VALID TILES ONLY ---
+# =========================================================================
+valid_srcs = []
+for fp in tif_files:
+    try:
+        src = rasterio.open(fp)
+        # Check for valid transform and CRS
+        if src.crs is None or any(np.isnan(src.bounds)):
+            print(f"⚠️ Skipping {os.path.basename(fp)} (invalid georeference or bounds).")
+            src.close()
+            continue
+        valid_srcs.append(src)
+    except Exception as e:
+        print(f"⚠️ Skipping {os.path.basename(fp)} due to error: {e}")
+
+if not valid_srcs:
+    raise RuntimeError("❌ No valid GeoTIFFs with proper georeference found.")
+
+print(f"Proceeding with {len(valid_srcs)} valid tiles...")
+
+# =========================================================================
+# --- MERGE OPERATION ---
+# =========================================================================
+mosaic, out_trans = merge(valid_srcs, method='first')
+
+# =========================================================================
+# --- HANDLE METADATA ---
+# =========================================================================
+meta = valid_srcs[0].meta.copy()
+
+# Handle NaNs in data
+if np.isnan(mosaic).any():
+    print("⚠️ NaN detected — converting to float32 and assigning nodata = -9999.")
+    mosaic = np.nan_to_num(mosaic, nan=-9999)
+    meta.update(dtype="float32", nodata=-9999)
+else:
+    meta.update(dtype=meta["dtype"])
+
+meta.update({
+    "driver": "GTiff",
+    "height": mosaic.shape[1],
+    "width": mosaic.shape[2],
+    "transform": out_trans,
+    "compress": "lzw"
+})
+
+# =========================================================================
+# --- SAVE MERGED RASTER ---
+# =========================================================================
+with rasterio.open(output_path, "w", **meta) as dest:
+    dest.write(mosaic.astype(meta["dtype"]))
+
+for src in valid_srcs:
+    src.close()
+
+print(f"✅ Merged GeoTIFF created successfully: {output_path}")
