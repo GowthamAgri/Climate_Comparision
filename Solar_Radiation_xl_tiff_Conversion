@@ -1,0 +1,110 @@
+import pandas as pd
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+import os
+import glob
+
+# --- INPUT FOLDER ---
+input_folder = r"D:\Global Solar Radiation\Solar Radiation\datafiles\Trial"
+output_root = os.path.join(input_folder, "GeoTIFF_Outputs")
+os.makedirs(output_root, exist_ok=True)
+
+# --- PARAMETERS AND CONSTANTS ---
+PARAMETERS = ['DTRAD']   # 🔁 CHANGED
+NODATA_VALUE = -9999
+DESIRED_RESOLUTION = 0.22457882  # degrees
+rows, cols = 1, 1
+START_DATE = pd.Timestamp('2019-01-01')
+END_DATE = pd.Timestamp('2024-12-31')
+
+# --- FUNCTION TO PROCESS EACH FILE ---
+def process_file(file_path):
+    print(f"\n=== Processing file: {os.path.basename(file_path)} ===")
+
+    # --- Load CSV or Excel ---
+    try:
+        if file_path.lower().endswith(".csv"):
+            df = pd.read_csv(
+                file_path,
+                usecols=['YEAR', 'MN', 'DT', 'DTRAD', 'Latitude', 'Longitude']
+            )
+        elif file_path.lower().endswith(".xlsx"):
+            df = pd.read_excel(
+                file_path,
+                usecols=['YEAR', 'MN', 'DT', 'DTRAD', 'Latitude', 'Longitude']
+            )
+        else:
+            print(f"⚠️ Skipping unsupported file: {file_path}")
+            return
+    except Exception as e:
+        print(f"❌ Error reading {os.path.basename(file_path)}: {e}")
+        return
+
+    # --- Extract station coordinates ---
+    try:
+        STATION_LATITUDE = float(df['Latitude'].iloc[0])
+        STATION_LONGITUDE = float(df['Longitude'].iloc[0])
+    except Exception as e:
+        print(f"❌ Could not extract Latitude/Longitude: {e}")
+        return
+
+    # --- Combine YEAR, MN, DT into Date ---
+    df['Date'] = pd.to_datetime(
+        dict(year=df['YEAR'], month=df['MN'], day=df['DT']),
+        errors='coerce'
+    )
+    df = df.dropna(subset=['Date'])
+
+    # --- Create full daily time series (2019–2024) ---
+    all_dates = pd.DataFrame({'Date': pd.date_range(START_DATE, END_DATE, freq='D')})
+    df_full = all_dates.merge(df[['Date', 'DTRAD']], on='Date', how='left')
+
+    # --- Fill missing values with NODATA ---
+    df_full['DTRAD'] = df_full['DTRAD'].fillna(NODATA_VALUE)
+
+    # --- Compute raster transform ---
+    half_res = DESIRED_RESOLUTION / 2.0
+    x_origin = STATION_LONGITUDE - half_res
+    y_origin = STATION_LATITUDE + half_res
+    transform = from_origin(x_origin, y_origin, DESIRED_RESOLUTION, DESIRED_RESOLUTION)
+
+    # --- Metadata ---
+    meta = {
+        'driver': 'GTiff',
+        'dtype': 'float32',
+        'nodata': NODATA_VALUE,
+        'width': cols,
+        'height': rows,
+        'count': len(df_full),   # number of days = bands
+        'crs': 'EPSG:4326',
+        'transform': transform
+    }
+
+    # --- Write GeoTIFF ---
+    station_name = os.path.splitext(os.path.basename(file_path))[0]
+    output_tiff = os.path.join(output_root, f"{station_name}_DTRAD_timeseries.tif")
+
+    data = df_full['DTRAD'].values.astype(np.float32).reshape(-1, rows, cols)
+
+    with rasterio.open(output_tiff, 'w', **meta) as dst:
+        dst.write(data)
+
+    print(f"✅ DTRAD → {output_tiff}")
+    print(f"📍 Lat={STATION_LATITUDE}, Lon={STATION_LONGITUDE}")
+    print(f"📅 Period: {START_DATE.date()} → {END_DATE.date()}")
+    print(f"✅ Finished: {station_name}\n")
+
+# --- MAIN LOOP ---
+all_files = glob.glob(os.path.join(input_folder, "*.csv")) + \
+            glob.glob(os.path.join(input_folder, "*.xlsx"))
+
+if not all_files:
+    print("⚠️ No CSV or Excel files found in the input folder.")
+else:
+    print(f"Found {len(all_files)} files. Starting batch conversion...\n")
+    for file in all_files:
+        process_file(file)
+
+print("\n🎯 All DTRAD GeoTIFFs successfully created.")
+print(f"📂 Output folder: {output_root}")
