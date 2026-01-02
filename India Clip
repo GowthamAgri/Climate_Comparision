@@ -1,0 +1,37 @@
+import os
+import rasterio
+from rasterio.mask import mask
+import geopandas as gpd
+
+# --- Set your directories ---
+input_folder = r"D:\ERA5_Download\ERA5_Outputs\Recent"   # folder with your input TIFFs
+output_folder = r"D:\ERA5_Download\ERA5_Outputs\Recent_Clipped"  # where clipped TIFFs will go
+vector_path = r"D:\ERA5_Download\ERA5_Outputs\Vector\INDIA_BOUNDARY_SOI.shp"  # your shapefile
+
+# Create output folder if it doesn't exist
+os.makedirs(output_folder, exist_ok=True)
+
+# --- Load the vector ---
+vector = gpd.read_file(vector_path)
+geom = [vector.union_all()]  # merge all geometries into one (optional if single polygon)
+
+# --- Loop over TIFFs ---
+for file in os.listdir(input_folder):
+    if file.endswith(".tif"):
+        in_path = os.path.join(input_folder, file)
+        out_path = os.path.join(output_folder, file.replace(".tif", "_clipped.tif"))
+
+        with rasterio.open(in_path) as src:
+            out_img, out_transform = mask(src, geom, crop=True)
+            out_meta = src.meta.copy()
+            out_meta.update({
+                "driver": "GTiff",
+                "height": out_img.shape[1],
+                "width": out_img.shape[2],
+                "transform": out_transform
+            })
+
+            with rasterio.open(out_path, "w", **out_meta) as dest:
+                dest.write(out_img)
+
+print("All rasters clipped successfully!")
