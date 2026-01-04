@@ -1,0 +1,59 @@
+import pandas as pd
+import os
+
+# ---------------------------
+# USER INPUT
+# ---------------------------
+input_file = r"D:\Global Solar Radiation\Solar Radiation\datafiles\RAD_Daily_NDCQ-2025-12-310_GLOBAL.csv"
+output_folder = r"D:\Global Solar Radiation\Solar Radiation\datafiles\station_wise_excels"
+
+os.makedirs(output_folder, exist_ok=True)
+
+# ---------------------------
+# READ INPUT FILE (AUTO-DETECT)
+# ---------------------------
+ext = os.path.splitext(input_file)[1].lower()
+
+if ext == ".csv":
+    df = pd.read_csv(input_file)
+elif ext == ".xlsx":
+    df = pd.read_excel(input_file, engine="openpyxl")
+elif ext == ".xls":
+    df = pd.read_excel(input_file, engine="xlrd")
+else:
+    raise ValueError("Unsupported file format. Use CSV or Excel.")
+
+# ---------------------------
+# CLEAN COLUMN NAMES
+# ---------------------------
+df.columns = df.columns.str.strip().str.upper()
+
+# ---------------------------
+# REQUIRED COLUMNS
+# ---------------------------
+required_cols = ['INDEX', 'YEAR', 'MN', 'DT', 'DTRAD']
+
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns in file: {missing}")
+
+# ---------------------------
+# GROUP BY STATION CODE
+# ---------------------------
+for station_code, group in df.groupby('INDEX'):
+
+    out_df = group[['YEAR', 'MN', 'DT', 'DTRAD']].copy()
+
+    # Sort chronologically
+    out_df = out_df.sort_values(['YEAR', 'MN', 'DT'])
+
+    out_file = os.path.join(
+        output_folder,
+        f"Station_{int(station_code)}_DTRAD.xlsx"
+    )
+
+    out_df.to_excel(out_file, index=False)
+
+    print(f"Saved: {out_file}")
+
+print("✅ Station-wise Excel files created successfully")
